@@ -1,0 +1,126 @@
+name: Clair Container Scan
+
+on:
+    push:
+        branches: ["master", "main"]
+    pull_request:
+        branches: ["master", "main"]
+    workflow_dispatch:
+
+jobs:
+    clair-scan:
+        name: Build & Scan with Clair
+        runs-on: ubuntu-latest
+
+        services:
+            # Clair requires a PostgreSQL database to store its vulnerability data
+            clair-db:
+                image: postgres:15-alpine
+                env:
+                    POSTGRES_USER: clair
+                    POSTGRES_PASSWORD: clair
+                    POSTGRES_DB: clair
+                options: >-
+                    --health-cmd pg_isready
+                    --health-interval 10s
+                    --health-timeout 5s
+                    --health-retries 5
+
+        steps:
+            # ── 1. Checkout source ────────────────────────────────────────────────
+            - name: Checkout repository
+              uses: actions/checkout@v6
+
+            # ── 2. Set up Docker Buildx ───────────────────────────────────────────
+            - name: Set up Docker Buildx
+              uses: docker/setup-buildx-action@v4
+
+            # ── 3. Build the Django NV image and save it as a tarball ────────────
+            - name: Build Docker image
+              uses: docker/build-push-action@v7
+              with:
+                  context: .
+                  push: false
+                  load: true
+                  tags: django-nv:${{ github.sha }}
+                  cache-from: type=gha
+                  cache-to: type=gha,mode=max
+
+            - name: Export image to tar
+              run: |
+                  docker save django-nv:${{ github.sha }} -o /tmp/django-nv.tar
+
+            # ── 4. Write the Clair v4 configuration file ─────────────────────────
+            - name: Write Clair config
+              run: |
+                  cat > /tmp/clair-config.yaml << 'EOF'
+                  http_listen_addr: "0.0.0.0:6060"
+                  introspection_addr: ""
+                  log_level: "warn"
+                  indexer:
+                    connstring: "host=localhost port=5432 user=clair password=clair dbname=clair sslmode=disable"
+                    scanlock_retry: 10
+                    layer_scan_concurrency: 5
+                    migrations: true
+                  matcher:
+                    connstring: "host=localhost port=5432 user=clair password=clair dbname=clair sslmode=disable"
+                    max_conn_pool: 100
+                    migrations: true
+                    indexer_addr: "http://localhost:6060"
+                  notifier:
+                    connstring: "host=localhost port=5432 user=clair password=clair dbname=clair sslmode=disable"
+                    migrations: true
+                    indexer_addr: "http://localhost:6060"
+                    matcher_addr: "http://localhost:6060"
+                  EOF
+
+            # ── 5. Download Clair v4 binary and clairctl ─────────────────────────
+            - name: Download Clair v4 and clairctl
+              run: |
+                  CLAIR_VERSION="v4.7.4"
+                  curl -sSfL "https://github.com/quay/clair/releases/download/${CLAIR_VERSION}/clair_linux_amd64" \
+                    -o /usr/local/bin/clair && chmod +x /usr/local/bin/clair
+                  curl -sSfL "https://github.com/quay/clair/releases/download/${CLAIR_VERSION}/clairctl_linux_amd64" \
+                    -o /usr/local/bin/clairctl && chmod +x /usr/local/bin/clairctl
+
+            # ── 6. Start Clair in combo (all-in-one) mode ─────────────────────────
+            - name: Start Clair
+              run: |
+                  clair -conf /tmp/clair-config.yaml -mode combo &
+                  echo "Waiting for Clair to be ready..."
+                  for i in $(seq 1 30); do
+                    if curl -sf http://localhost:6060/healthz > /dev/null 2>&1; then
+                      echo "Clair is up."
+                      break
+                    fi
+                    echo "  attempt $i/30..."
+                    sleep 5
+                  done
+
+            # ── 7. Index the image ────────────────────────────────────────────────
+            - name: Submit image for indexing
+              run: |
+                  clairctl --host http://localhost:6060 report \
+                    --out json \
+                    /tmp/django-nv.tar \
+                    2>&1 | tee /tmp/clair-report.json
+
+            # ── 8. Upload report as workflow artifact ────────────────────────────
+            - name: Upload Clair vulnerability report
+              uses: actions/upload-artifact@v7
+              if: always()
+              with:
+                  name: clair-vulnerability-report-${{ github.sha }}
+                  path: /tmp/clair-report.json
+                  retention-days: 30
+
+            # ── 9. Parse report and fail on HIGH/CRITICAL findings ───────────────
+            - name: Check for critical or high vulnerabilities
+              run: |
+                  HIGH=$(jq '[.[] | select(.severity == "High" or .severity == "Critical")] | length' /tmp/clair-report.json 2>/dev/null || echo "0")
+                  echo "High/Critical vulnerabilities found: $HIGH"
+                  if [ "$HIGH" -gt "0" ]; then
+                    echo "::error::Found $HIGH High/Critical severity vulnerabilities. Review the uploaded artifact."
+                    exit 1
+                  fi
+                  echo "No High or Critical vulnerabilities found."

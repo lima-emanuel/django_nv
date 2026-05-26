@@ -1,126 +1,160 @@
-name: Clair Container Scan
+name: Clair image scan
 
 on:
-    push:
-        branches: ["master", "main"]
-    pull_request:
-        branches: ["master", "main"]
-    workflow_dispatch:
+  push:
+    paths:
+      - Dockerfile
+      - requirements.txt
+      - .github/workflows/clair-scan.yml
+  pull_request:
+    paths:
+      - Dockerfile
+      - requirements.txt
+      - .github/workflows/clair-scan.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
 
 jobs:
-    clair-scan:
-        name: Build & Scan with Clair
-        runs-on: ubuntu-latest
+  clair-scan:
+    runs-on: ubuntu-latest
+    env:
+      CLAIR_VERSION: v4.9.0
+      IMAGE: ghcr.io/${{ github.repository }}:${{ github.sha }}
 
-        services:
-            # Clair requires a PostgreSQL database to store its vulnerability data
-            clair-db:
-                image: postgres:15-alpine
-                env:
-                    POSTGRES_USER: clair
-                    POSTGRES_PASSWORD: clair
-                    POSTGRES_DB: clair
-                options: >-
-                    --health-cmd pg_isready
-                    --health-interval 10s
-                    --health-timeout 5s
-                    --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
 
-        steps:
-            # ── 1. Checkout source ────────────────────────────────────────────────
-            - name: Checkout repository
-              uses: actions/checkout@v6
+      - name: Decide if we can push to GHCR
+        id: guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]] && [[ "${{ github.event.pull_request.head.repo.full_name }}" != "${{ github.repository }}" ]]; then
+            echo "can_push=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping Clair scan: PR from fork cannot push to GHCR with GITHUB_TOKEN." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "can_push=true" >> "$GITHUB_OUTPUT"
+          fi
 
-            # ── 2. Set up Docker Buildx ───────────────────────────────────────────
-            - name: Set up Docker Buildx
-              uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@v3
+        if: steps.guard.outputs.can_push == 'true'
 
-            # ── 3. Build the Django NV image and save it as a tarball ────────────
-            - name: Build Docker image
-              uses: docker/build-push-action@v7
-              with:
-                  context: .
-                  push: false
-                  load: true
-                  tags: django-nv:${{ github.sha }}
-                  cache-from: type=gha
-                  cache-to: type=gha,mode=max
+      - name: Log in to GHCR
+        if: steps.guard.outputs.can_push == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-            - name: Export image to tar
-              run: |
-                  docker save django-nv:${{ github.sha }} -o /tmp/django-nv.tar
+      - name: Build and push image (from Dockerfile)
+        if: steps.guard.outputs.can_push == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ${{ env.IMAGE }}
 
-            # ── 4. Write the Clair v4 configuration file ─────────────────────────
-            - name: Write Clair config
-              run: |
-                  cat > /tmp/clair-config.yaml << 'EOF'
-                  http_listen_addr: "0.0.0.0:6060"
-                  introspection_addr: ""
-                  log_level: "warn"
-                  indexer:
-                    connstring: "host=localhost port=5432 user=clair password=clair dbname=clair sslmode=disable"
-                    scanlock_retry: 10
-                    layer_scan_concurrency: 5
-                    migrations: true
-                  matcher:
-                    connstring: "host=localhost port=5432 user=clair password=clair dbname=clair sslmode=disable"
-                    max_conn_pool: 100
-                    migrations: true
-                    indexer_addr: "http://localhost:6060"
-                  notifier:
-                    connstring: "host=localhost port=5432 user=clair password=clair dbname=clair sslmode=disable"
-                    migrations: true
-                    indexer_addr: "http://localhost:6060"
-                    matcher_addr: "http://localhost:6060"
-                  EOF
+      - name: Start Postgres + Clair (combo)
+        if: steps.guard.outputs.can_push == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
 
-            # ── 5. Download Clair v4 binary and clairctl ─────────────────────────
-            - name: Download Clair v4 and clairctl
-              run: |
-                  CLAIR_VERSION="v4.7.4"
-                  curl -sSfL "https://github.com/quay/clair/releases/download/${CLAIR_VERSION}/clair_linux_amd64" \
-                    -o /usr/local/bin/clair && chmod +x /usr/local/bin/clair
-                  curl -sSfL "https://github.com/quay/clair/releases/download/${CLAIR_VERSION}/clairctl_linux_amd64" \
-                    -o /usr/local/bin/clairctl && chmod +x /usr/local/bin/clairctl
+          docker network create clairnet
 
-            # ── 6. Start Clair in combo (all-in-one) mode ─────────────────────────
-            - name: Start Clair
-              run: |
-                  clair -conf /tmp/clair-config.yaml -mode combo &
-                  echo "Waiting for Clair to be ready..."
-                  for i in $(seq 1 30); do
-                    if curl -sf http://localhost:6060/healthz > /dev/null 2>&1; then
-                      echo "Clair is up."
-                      break
-                    fi
-                    echo "  attempt $i/30..."
-                    sleep 5
-                  done
+          docker run -d --name clairdb --network clairnet -p 5432:5432 \
+            -e POSTGRES_USER=clair \
+            -e POSTGRES_PASSWORD=clair \
+            -e POSTGRES_DB=clair \
+            postgres:16-alpine
 
-            # ── 7. Index the image ────────────────────────────────────────────────
-            - name: Submit image for indexing
-              run: |
-                  clairctl --host http://localhost:6060 report \
-                    --out json \
-                    /tmp/django-nv.tar \
-                    2>&1 | tee /tmp/clair-report.json
+          for i in {1..30}; do
+            if docker exec clairdb pg_isready -U clair -d clair >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
 
-            # ── 8. Upload report as workflow artifact ────────────────────────────
-            - name: Upload Clair vulnerability report
-              uses: actions/upload-artifact@v7
-              if: always()
-              with:
-                  name: clair-vulnerability-report-${{ github.sha }}
-                  path: /tmp/clair-report.json
-                  retention-days: 30
+          cat > clair-config.yaml <<'YAML'
+          http_listen_addr: ":6060"
+          introspection_addr: ":6061"
+          log_level: "info"
+          indexer:
+            connstring: "postgresql://clair:clair@clairdb:5432/clair?sslmode=disable"
+            migrations: true
+          matcher:
+            connstring: "postgresql://clair:clair@clairdb:5432/clair?sslmode=disable"
+            migrations: true
+            disable_updaters: true
+          notifier:
+            connstring: "postgresql://clair:clair@clairdb:5432/clair?sslmode=disable"
+            migrations: true
+          YAML
 
-            # ── 9. Parse report and fail on HIGH/CRITICAL findings ───────────────
-            - name: Check for critical or high vulnerabilities
-              run: |
-                  HIGH=$(jq '[.[] | select(.severity == "High" or .severity == "Critical")] | length' /tmp/clair-report.json 2>/dev/null || echo "0")
-                  echo "High/Critical vulnerabilities found: $HIGH"
-                  if [ "$HIGH" -gt "0" ]; then
-                    echo "::error::Found $HIGH High/Critical severity vulnerabilities. Review the uploaded artifact."
-                    exit 1
-                  fi
-                  echo "No High or Critical vulnerabilities found."
+          docker run -d --name clair --network clairnet -p 6060:6060 -p 6061:6061 \
+            -v "$PWD/clair-config.yaml:/etc/clair/config.yaml:ro" \
+            quay.io/projectquay/clair:4.9.0 \
+              -conf /etc/clair/config.yaml -mode combo
+
+          for i in {1..60}; do
+            if curl -fsS "http://localhost:6061/readyz" >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "Clair did not become ready in time" >&2
+          docker logs clairdb | tail -n 200 || true
+          docker logs clair | tail -n 200 || true
+          exit 1
+
+      - name: Download clairctl
+        if: steps.guard.outputs.can_push == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL -o clairctl "https://github.com/quay/clair/releases/download/${CLAIR_VERSION}/clairctl-linux-amd64"
+          chmod +x clairctl
+          ./clairctl --version
+
+      - name: Populate vulnerability database (export/import updaters)
+        if: steps.guard.outputs.can_push == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > clairctl-config.yaml <<'YAML'
+          matcher:
+            connstring: "postgresql://clair:clair@localhost:5432/clair?sslmode=disable"
+          YAML
+
+          ./clairctl -c clairctl-config.yaml export-updaters updates.json.gz
+          ./clairctl -c clairctl-config.yaml import-updaters updates.json.gz
+
+      - name: Run Clair report
+        if: steps.guard.outputs.can_push == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./clairctl report --host http://localhost:6060/ --out json "${IMAGE}" | tee clair-report.json
+
+      - name: Fail on High/Critical
+        if: steps.guard.outputs.can_push == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          count=$(jq '[..|objects|.severity? // empty] | map(ascii_downcase) | map(select(.=="high" or .=="critical")) | length' clair-report.json)
+          echo "High/Critical findings: $count"
+          test "$count" -eq 0
+
+      - name: Upload report artifact
+        if: steps.guard.outputs.can_push == 'true' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clair-report
+          path: clair-report.json
